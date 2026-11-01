@@ -38,6 +38,13 @@ class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
     # Bot settings
+    bot_platform: Literal["telegram", "bale"] = Field(
+        "telegram", description="Messaging platform (telegram or bale)"
+    )
+    bot_base_url: Optional[str] = Field(None, description="Override Bot API URL prefix")
+    bot_base_file_url: Optional[str] = Field(
+        None, description="Override Bot file download URL prefix"
+    )
     telegram_bot_token: SecretStr = Field(
         ..., description="Telegram bot token from BotFather"
     )
@@ -498,6 +505,12 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def validate_cross_field_dependencies(self) -> "Settings":
         """Validate dependencies between fields."""
+        if self.bot_platform == "bale":
+            if self.enable_project_threads or self.enable_stream_drafts:
+                raise ValueError(
+                    "Bale does not support project threads or stream drafts; "
+                    "disable ENABLE_PROJECT_THREADS and ENABLE_STREAM_DRAFTS"
+                )
         # Check auth token requirements
         if self.enable_token_auth and not self.auth_token_secret:
             raise ValueError(

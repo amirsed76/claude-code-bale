@@ -74,38 +74,48 @@ class ClaudeCodeBot:
 
         # Create application
         builder = Application.builder()
-        builder.token(self.settings.telegram_token_str)
-        builder.defaults(Defaults(do_quote=self.settings.reply_quote))
-        builder.rate_limiter(AIORateLimiter(max_retries=1))
+        if self.settings.bot_platform == "bale":
+            from .bale import create_bale_bot
+
+            builder.bot(create_bale_bot(self.settings))
+        else:
+            builder.token(self.settings.telegram_token_str)
+            builder.defaults(Defaults(do_quote=self.settings.reply_quote))
+            builder.rate_limiter(AIORateLimiter(max_retries=1))
+
+            # Configure connection settings
+            builder.connect_timeout(30)
+            builder.read_timeout(30)
+            builder.write_timeout(30)
+            builder.pool_timeout(30)
+
+            # Long polling uses a separate HTTP client whose connection pool holds a
+            # single connection by default. If a long-running getUpdates request is
+            # torn down mid-flight (unstable network, proxy or tunnel drop), that
+            # connection can stay checked out, and every later getUpdates call then
+            # fails with "Pool timeout: All connections in the connection pool are
+            # occupied", permanently, even after the network recovers. A small pool
+            # leaves headroom so polling can recover on its own.
+            builder.get_updates_connection_pool_size(8)
+
+            # Explicitly set proxy from environment variables.
+            # This is necessary because python-telegram-bot's Application.builder()
+            # does not automatically use HTTP_PROXY/HTTPS_PROXY environment variables.
+            # Without this, the httpx connection pool can become corrupted when running
+            # behind a proxy, causing the bot to stop responding to messages.
+            proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+            if proxy_url:
+                builder.proxy(proxy_url)
+                logger.info("Proxy configured", proxy=_redact_proxy_url(proxy_url))
+
+            if self.settings.bot_base_url:
+                builder.base_url(self.settings.bot_base_url)
+            if self.settings.bot_base_file_url:
+                builder.base_file_url(self.settings.bot_base_file_url)
 
         from .update_processor import StopAwareUpdateProcessor
 
         builder.concurrent_updates(StopAwareUpdateProcessor())
-
-        # Configure connection settings
-        builder.connect_timeout(30)
-        builder.read_timeout(30)
-        builder.write_timeout(30)
-        builder.pool_timeout(30)
-
-        # Long polling uses a separate HTTP client whose connection pool holds a
-        # single connection by default. If a long-running getUpdates request is
-        # torn down mid-flight (unstable network, proxy or tunnel drop), that
-        # connection can stay checked out, and every later getUpdates call then
-        # fails with "Pool timeout: All connections in the connection pool are
-        # occupied", permanently, even after the network recovers. A small pool
-        # leaves headroom so polling can recover on its own.
-        builder.get_updates_connection_pool_size(8)
-
-        # Explicitly set proxy from environment variables.
-        # This is necessary because python-telegram-bot's Application.builder()
-        # does not automatically use HTTP_PROXY/HTTPS_PROXY environment variables.
-        # Without this, the httpx connection pool can become corrupted when running
-        # behind a proxy, causing the bot to stop responding to messages.
-        proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
-        if proxy_url:
-            builder.proxy(proxy_url)
-            logger.info("Proxy configured", proxy=_redact_proxy_url(proxy_url))
 
         self.app = builder.build()
 
@@ -139,6 +149,9 @@ class ClaudeCodeBot:
 
     async def _set_bot_commands(self) -> None:
         """Set bot command menu via orchestrator."""
+        if self.settings.bot_platform == "bale":
+            logger.info("Skipping command menu registration for Bale")
+            return
         commands = await self.orchestrator.get_bot_commands()
         await self.app.bot.set_my_commands(commands)
         logger.info("Bot commands set", commands=[cmd.command for cmd in commands])

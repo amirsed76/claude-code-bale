@@ -1,3 +1,9 @@
+# Claude Code through Bale
+
+This local adaptation of [overwirehq/claude-code-telegram](https://github.com/overwirehq/claude-code-telegram)
+adds Bale support. See [Bale setup](docs/bale.md) for configuration and limitations.
+Telegram remains available with `BOT_PLATFORM=telegram`.
+
 # Claude Code Telegram Bot
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -73,7 +79,7 @@ cp .env.example .env
 
 **Minimum required:**
 ```bash
-TELEGRAM_BOT_TOKEN=1234567890:ABC-DEF1234ghIkl-zyx57W2v1u123ew11
+TELEGRAM_BOT_TOKEN=your_bot_token_here
 TELEGRAM_BOT_USERNAME=my_claude_bot
 APPROVED_DIRECTORY=/Users/yourname/projects
 ALLOWED_USERS=123456789  # Your Telegram user ID
