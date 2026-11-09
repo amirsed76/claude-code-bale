@@ -254,6 +254,8 @@ class ClaudeCodeBot:
 
         try:
             self.is_running = True
+            # main wires project/thread routing after initialize(), before start().
+            await self.orchestrator.initialize_background_tasks(self.app)
 
             if self.settings.webhook_url:
                 # Webhook mode - use start/start_webhook instead of run_webhook
@@ -287,6 +289,8 @@ class ClaudeCodeBot:
             logger.error("Error running bot", error=str(e))
             raise ClaudeCodeTelegramError(f"Failed to start bot: {str(e)}") from e
         finally:
+            if self.orchestrator.task_queue is not None:
+                await self.orchestrator.task_queue.close()
             self.is_running = False
 
     async def stop(self) -> None:
@@ -299,6 +303,9 @@ class ClaudeCodeBot:
 
         try:
             self.is_running = False  # Stop the main loop first
+
+            if self.orchestrator.task_queue is not None:
+                await self.orchestrator.task_queue.close()
 
             # Shutdown feature registry
             if self.feature_registry:

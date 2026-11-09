@@ -389,3 +389,10 @@ ANTHROPIC_API_KEY=sk-ant-api03-your-key-here
 - **Rotate tokens regularly** if using token-based auth
 - **Restrict `APPROVED_DIRECTORY`** to only necessary paths
 - **Monitor logs** for configuration errors and security events
+
+### Persistent background text tasks
+
+Set `ENABLE_BACKGROUND_TASKS=true` to persist accepted agentic text requests in
+SQLite and continue automatically when a batch reaches `CLAUDE_MAX_TURNS` or
+`CLAUDE_TIMEOUT_SECONDS`. See [Background tasks](background-tasks.md) for recovery,
+Stop controls, budget behaviour, and delivery guarantees. Disabled by default.

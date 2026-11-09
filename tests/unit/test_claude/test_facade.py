@@ -294,3 +294,45 @@ class TestEmptySessionIdWarning:
 
         # Session ID should be empty on the response
         assert not result.session_id
+
+
+async def test_durable_checkpoint_resumes_cli_session_missing_from_storage(
+    facade, tmp_path
+):
+    """The CLI may have run tools before its first ResultMessage was saved."""
+    from unittest.mock import AsyncMock
+
+    response = _make_mock_response("session-from-init")
+    facade.sdk_manager.execute_command = AsyncMock(return_value=response)
+    checkpoint = AsyncMock()
+    await facade.run_command(
+        "Continue",
+        tmp_path,
+        42,
+        session_id="session-from-init",
+        strict_resume=True,
+        session_checkpoint=checkpoint,
+    )
+    options = facade.sdk_manager.execute_command.call_args.kwargs
+    assert options["session_id"] == "session-from-init"
+    assert options["continue_session"] is True
+    assert options["session_checkpoint"] is checkpoint
+
+
+async def test_durable_resume_error_does_not_restart_task(facade, tmp_path):
+    from unittest.mock import AsyncMock
+
+    from src.claude.exceptions import ClaudeTimeoutError
+
+    facade.sdk_manager.execute_command = AsyncMock(
+        side_effect=ClaudeTimeoutError("timeout")
+    )
+    with pytest.raises(ClaudeTimeoutError):
+        await facade.run_command(
+            "Continue",
+            tmp_path,
+            42,
+            session_id="saved-cli-session",
+            strict_resume=True,
+        )
+    facade.sdk_manager.execute_command.assert_awaited_once()

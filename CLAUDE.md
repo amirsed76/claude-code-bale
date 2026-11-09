@@ -71,6 +71,7 @@ context.bot_data["security_validator"]
 - `src/bot/middleware/` -- Auth, rate limit, security input validation
 - `src/bot/features/` -- Git integration, file handling, quick actions, session export
 - `src/bot/orchestrator.py` -- MessageOrchestrator: routes to agentic or classic handlers, project-topic routing
+- `src/bot/task_queue.py` -- Optional persistent background text execution, continuation, recovery, and result delivery; see `docs/background-tasks.md` before changing task lifecycle behaviour
 - `src/claude/` -- Claude integration facade, SDK/CLI managers, session management, tool monitoring
 - `src/projects/` -- Multi-project support: `registry.py` (YAML project config), `thread_manager.py` (Telegram topic sync/routing)
 - `src/storage/` -- SQLite via aiosqlite, repository pattern (users, sessions, messages, tool_usage, audit_log, cost_tracking, project_threads)
@@ -97,6 +98,8 @@ Optional interactive approval layer: when `INTERACTIVE_TOOL_APPROVAL=true`, tool
 Webhook authentication: GitHub HMAC-SHA256 signature verification, generic Bearer token for other providers, atomic deduplication via `webhook_events` table.
 
 ### Configuration
+
+Persistent background tasks: `ENABLE_BACKGROUND_TASKS` (default false) enables automatic continuation and restart recovery for agentic text requests. `/stop` is registered when enabled; `/status` includes durable task state and batch count. See `docs/background-tasks.md` for limits and delivery guarantees.
 
 Settings loaded from environment variables via Pydantic Settings. Required: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_BOT_USERNAME`, `APPROVED_DIRECTORY`. Key optional: `ALLOWED_USERS` (comma-separated Telegram IDs), `ANTHROPIC_API_KEY`, `ENABLE_MCP`, `MCP_CONFIG_PATH`.
 

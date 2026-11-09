@@ -1909,3 +1909,56 @@ class TestNumTurns:
             )
 
         assert response.num_turns == 2
+
+
+async def test_session_checkpoint_is_saved_from_init_before_tools(tmp_path):
+    config = Settings(
+        telegram_bot_token="test:token",
+        telegram_bot_username="testbot",
+        approved_directory=tmp_path,
+    )
+    manager = ClaudeSDKManager(config)
+    checkpoint = AsyncMock()
+    client = _mock_client(
+        {"type": "system", "subtype": "init", "session_id": "early-session"},
+        _make_assistant_message("Working"),
+        _make_result_message(session_id="early-session"),
+    )
+    with patch("src.claude.sdk_integration.ClaudeSDKClient", return_value=client):
+        result = await manager.execute_command(
+            "Do work",
+            tmp_path,
+            session_checkpoint=checkpoint,
+        )
+    checkpoint.assert_awaited_once_with("early-session")
+    assert result.session_id == "early-session"
+
+
+async def test_shutdown_cancels_and_disconnects_shielded_cli_task(tmp_path):
+    config = Settings(
+        telegram_bot_token="test:token",
+        telegram_bot_username="testbot",
+        approved_directory=tmp_path,
+    )
+    manager = ClaudeSDKManager(config)
+    started = asyncio.Event()
+    closed = asyncio.Event()
+    client = _mock_client()
+
+    async def receive():
+        try:
+            started.set()
+            await asyncio.Event().wait()
+            yield None
+        finally:
+            closed.set()
+
+    client._query.receive_messages = receive
+    with patch("src.claude.sdk_integration.ClaudeSDKClient", return_value=client):
+        execution = asyncio.create_task(manager.execute_command("Do work", tmp_path))
+        await started.wait()
+        execution.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await execution
+    assert closed.is_set()
+    client.disconnect.assert_awaited_once()
