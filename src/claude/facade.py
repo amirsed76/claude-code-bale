@@ -43,6 +43,8 @@ class ClaudeIntegration:
         approval_callback: Optional[
             Callable[[str, Dict[str, Any]], Awaitable[bool]]
         ] = None,
+        session_checkpoint: Optional[Callable[[str], Awaitable[None]]] = None,
+        strict_resume: bool = False,
     ) -> ClaudeResponse:
         """Run Claude Code command with full integration."""
         logger.info(
@@ -79,11 +81,20 @@ class ClaudeIntegration:
         try:
             # Continue session if we have an existing session with a real ID
             is_new = getattr(session, "is_new_session", False)
-            should_continue = not is_new and bool(session.session_id)
+            should_continue = (strict_resume and bool(session_id)) or (
+                not is_new and bool(session.session_id)
+            )
 
             # For new sessions, don't pass session_id to Claude Code
-            claude_session_id = session.session_id if should_continue else None
+            claude_session_id = (
+                (session_id if strict_resume and session_id else session.session_id)
+                if should_continue
+                else None
+            )
 
+            checkpoint_options = {}
+            if session_checkpoint is not None:
+                checkpoint_options["session_checkpoint"] = session_checkpoint
             try:
                 response = await self._execute(
                     prompt=prompt,
@@ -94,12 +105,13 @@ class ClaudeIntegration:
                     interrupt_event=interrupt_event,
                     images=images,
                     approval_callback=approval_callback,
+                    **checkpoint_options,
                 )
             except Exception as resume_error:
                 # If resume failed (e.g., session expired/missing on Claude's side),
                 # retry as a fresh session.  The CLI returns a generic exit-code-1
                 # when the session is gone, so we catch *any* error during resume.
-                if should_continue:
+                if should_continue and not strict_resume:
                     logger.warning(
                         "Session resume failed, starting fresh session",
                         failed_session_id=claude_session_id,
@@ -169,8 +181,12 @@ class ClaudeIntegration:
         approval_callback: Optional[
             Callable[[str, Dict[str, Any]], Awaitable[bool]]
         ] = None,
+        session_checkpoint: Optional[Callable[[str], Awaitable[None]]] = None,
     ) -> ClaudeResponse:
         """Execute command via SDK."""
+        checkpoint_options = {}
+        if session_checkpoint is not None:
+            checkpoint_options["session_checkpoint"] = session_checkpoint
         return await self.sdk_manager.execute_command(
             prompt=prompt,
             working_directory=working_directory,
@@ -180,6 +196,7 @@ class ClaudeIntegration:
             interrupt_event=interrupt_event,
             images=images,
             approval_callback=approval_callback,
+            **checkpoint_options,
         )
 
     async def _find_resumable_session(

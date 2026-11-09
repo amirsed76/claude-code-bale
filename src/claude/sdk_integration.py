@@ -410,6 +410,7 @@ class ClaudeSDKManager:
         approval_callback: Optional[
             Callable[[str, Dict[str, Any]], Awaitable[bool]]
         ] = None,
+        session_checkpoint: Optional[Callable[[str], Awaitable[None]]] = None,
     ) -> ClaudeResponse:
         """Execute Claude Code command via SDK."""
         start_time = asyncio.get_event_loop().time()
@@ -565,8 +566,10 @@ class ClaudeSDKManager:
             # Collect messages via ClaudeSDKClient
             messages: List[Message] = []
             interrupted = False
+            checkpointed_session_id = None
 
             async def _run_client() -> None:
+                nonlocal checkpointed_session_id
                 client = ClaudeSDKClient(options)
                 try:
                     await client.connect()
@@ -603,6 +606,20 @@ class ClaudeSDKManager:
                         await client.query(prompt)
 
                     async for raw_data in client._query.receive_messages():
+                        # Save the CLI's init session before executing tools. This
+                        # must not depend on optional UI streaming succeeding.
+                        raw_session_id = (
+                            raw_data.get("session_id")
+                            if isinstance(raw_data, dict)
+                            else None
+                        )
+                        if (
+                            session_checkpoint
+                            and raw_session_id
+                            and raw_session_id != checkpointed_session_id
+                        ):
+                            await session_checkpoint(raw_session_id)
+                            checkpointed_session_id = raw_session_id
                         try:
                             message = parse_message(raw_data)
                         except MessageParseError as e:
@@ -633,7 +650,11 @@ class ClaudeSDKManager:
                     await client.disconnect()
 
             # Execute with timeout and retry, racing against optional interrupt
-            max_attempts = max(1, self.config.claude_retry_max_attempts)
+            max_attempts = (
+                1
+                if session_checkpoint
+                else max(1, self.config.claude_retry_max_attempts)
+            )
             last_exc: Optional[BaseException] = None
 
             for attempt in range(max_attempts):
@@ -680,6 +701,11 @@ class ClaudeSDKManager:
                     break  # success — exit retry loop
                 except asyncio.CancelledError:
                     if not interrupted:
+                        run_task.cancel()
+                        try:
+                            await run_task
+                        except asyncio.CancelledError:
+                            pass
                         raise
                     # Interrupt cancelled the task — wait for cleanup
                     try:

@@ -45,6 +45,7 @@ of M0 in `docs/ROADMAP-v2.md`, which plans to ship as 1.8.
 - **Project URLs**: the Homepage, Repository and Documentation links in `pyproject.toml` pointed at `github.com/richardatkinson/...`, an owner unrelated to this project, so `pip show` and any future PyPI listing linked to the wrong place
 
 ### Added
+- **Persistent background text tasks**: opt in with `ENABLE_BACKGROUND_TASKS=true` to automatically continue agentic text requests after turn or time limits, resume saved Claude sessions after restart, and retry result delivery without executing the task again. `/status` reports the task and batch count; `/stop` and Stop buttons persist cancellation. Cost caps, tool permissions, and repeated-failure safeguards remain in effect. See `docs/background-tasks.md` for recovery and delivery guarantees.
 - **Dependabot**: weekly PRs for `claude-agent-sdk`, `python-telegram-bot` and `anthropic`; monthly grouped PRs for other Python dependencies and GitHub Actions
 - **Claude Code Review workflow**: read-only first-pass review comment on every non-draft pull request, including fork PRs. Requires the `CLAUDE_CODE_OAUTH_TOKEN` (or `ANTHROPIC_API_KEY`) repository secret
 

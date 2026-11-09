@@ -11,6 +11,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import structlog
@@ -21,6 +22,7 @@ from telegram import (
     InputMediaPhoto,
     Update,
 )
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -30,7 +32,7 @@ from telegram.ext import (
     filters,
 )
 
-from ..claude.sdk_integration import StreamUpdate
+from ..claude.sdk_integration import ClaudeResponse, StreamUpdate
 from ..config.settings import Settings
 from ..projects import PrivateTopicsUnavailableError
 from .utils.draft_streamer import DraftStreamer, generate_draft_id
@@ -142,6 +144,7 @@ class MessageOrchestrator:
     def __init__(self, settings: Settings, deps: Dict[str, Any]):
         self.settings = settings
         self.deps = deps
+        self.task_queue = None
         self._active_requests: Dict[int, ActiveRequest] = {}
         self._pending_tool_approvals: Dict[str, PendingToolApproval] = {}
         self._known_commands: frozenset[str] = frozenset()
@@ -158,7 +161,10 @@ class MessageOrchestrator:
             is_sync_bypass = handler.__name__ == "sync_threads"
             is_start_bypass = handler.__name__ in {"start_command", "agentic_start"}
             message_thread_id = self._extract_message_thread_id(update)
-            should_enforce = self.settings.enable_project_threads
+            should_enforce = (
+                self.settings.enable_project_threads
+                and handler.__name__ != "agentic_stop"
+            )
 
             if should_enforce:
                 if self.settings.project_threads_mode == "private":
@@ -173,6 +179,23 @@ class MessageOrchestrator:
                 if not allowed:
                     return
 
+            if (
+                self.task_queue is not None
+                and update.effective_user.id in self.task_queue.workers
+                and handler.__name__
+                in {
+                    "agentic_new",
+                    "agentic_repo",
+                    "agentic_document",
+                    "agentic_photo",
+                    "agentic_voice",
+                }
+            ):
+                await update.effective_message.reply_text(
+                    "A task is running. Stop it before changing sessions "
+                    "or sending files."
+                )
+                return
             try:
                 await handler(update, context)
             finally:
@@ -339,6 +362,8 @@ class MessageOrchestrator:
             ("repo", self.agentic_repo),
             ("restart", command.restart_command),
         ]
+        if self.settings.enable_background_tasks:
+            handlers.append(("stop", self.agentic_stop))
         if self.settings.enable_project_threads:
             handlers.append(("sync_threads", command.sync_threads))
 
@@ -480,6 +505,8 @@ class MessageOrchestrator:
                 BotCommand("repo", "List repos / switch workspace"),
                 BotCommand("restart", "Restart the bot"),
             ]
+            if self.settings.enable_background_tasks:
+                commands.append(BotCommand("stop", "Stop the running task"))
             if self.settings.enable_project_threads:
                 commands.append(BotCommand("sync_threads", "Sync project topics"))
             return commands
@@ -560,6 +587,22 @@ class MessageOrchestrator:
             parse_mode="HTML",
         )
 
+    async def agentic_stop(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Stop a durable task even during reconnect backoff."""
+        stopped = self.task_queue is not None and await self.task_queue.stop(
+            update.effective_user.id
+        )
+        await update.message.reply_text(
+            "Stopping..." if stopped else "No task is running."
+        )
+        audit = context.bot_data.get("audit_logger")
+        if audit:
+            await audit.log_command(
+                user_id=update.effective_user.id, command="stop", args=[], success=True
+            )
+
     async def agentic_new(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -594,8 +637,13 @@ class MessageOrchestrator:
             except Exception:
                 pass
 
+        task_str = ""
+        if self.task_queue is not None:
+            job = await self.task_queue.latest(update.effective_user.id)
+            if job:
+                task_str = f" · Task #{job.id}: {job.state} · Batches: {job.attempts}"
         await update.message.reply_text(
-            f"📂 {dir_display} · Session: {session_status}{cost_str}"
+            f"📂 {dir_display} · Session: {session_status}{cost_str}{task_str}"
         )
 
     def _get_verbose_level(self, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -971,12 +1019,159 @@ class MessageOrchestrator:
 
         return caption_sent
 
+    async def initialize_background_tasks(self, app: Application) -> None:
+        """Recover durable text requests after the bot client is initialized."""
+        if not self.settings.enable_background_tasks or not self.settings.agentic_mode:
+            return
+        from .task_queue import TaskQueue
+
+        self._task_application = app
+        self.task_queue = TaskQueue(
+            self.deps["storage"].db_manager.database_path,
+            self._execute_background_task,
+            self._deliver_background_task,
+            self._authorize_background_task,
+        )
+        await self.task_queue.initialize()
+        await self.task_queue.recover()
+
+    async def _authorize_background_task(self, job: Any) -> bool:
+        manager = self.deps.get("auth_manager")
+        if manager and not await manager.authenticate_user(job.user_id):
+            return False
+        directory = Path(job.payload["directory"]).resolve()
+        if not directory.is_dir() or not self._is_within(
+            directory, self.settings.approved_directory.resolve()
+        ):
+            return False
+        # Re-resolve topic routing after restart; removed projects cannot run.
+        if self.settings.enable_project_threads:
+            manager = self.deps.get("project_threads_manager")
+            update = Update.de_json(job.payload["update"], self._task_application.bot)
+            if manager is None:
+                return False
+            project = await manager.resolve_project(
+                update.effective_chat.id, self._extract_message_thread_id(update)
+            )
+            if project is None or not self._is_within(directory, project.absolute_path):
+                return False
+        return True
+
+    async def _execute_background_task(
+        self, job: Any, interrupt_event: asyncio.Event
+    ) -> ClaudeResponse:
+        from .task_queue import CONTINUE_PROMPT
+
+        app = self._task_application
+        update = Update.de_json(job.payload["update"], app.bot)
+        user_data = dict(job.payload["user_data"])
+        user_data["current_directory"] = Path(job.payload["directory"])
+        if job.session_id:
+            user_data["claude_session_id"] = job.session_id
+            user_data["force_new_session"] = False
+        context = SimpleNamespace(
+            bot=app.bot,
+            application=app,
+            bot_data={**self.deps, "settings": self.settings},
+            user_data=user_data,
+        )
+        response = await self._execute_agentic_text(
+            update,
+            context,
+            job=job,
+            interrupt_event=interrupt_event,
+            prompt=CONTINUE_PROMPT if job.attempts else None,
+        )
+        self._persist_thread_state(context)
+        shared = app.user_data[job.user_id]
+        thread_context = user_data.get("_thread_context")
+        if thread_context:
+            key = thread_context["state_key"]
+            shared.setdefault("thread_state", {})[key] = user_data["thread_state"][key]
+        elif str(
+            shared.get("current_directory", self.settings.approved_directory)
+        ) == str(user_data["current_directory"]):
+            shared["claude_session_id"] = response.session_id
+        return response
+
+    async def _deliver_background_task(self, job: Any) -> None:
+        from .utils.formatting import ResponseFormatter, with_stop_reason
+
+        update = Update.de_json(job.payload["update"], self._task_application.bot)
+        messages = ResponseFormatter(self.settings).format_claude_response(
+            with_stop_reason(job.response)
+        )
+        for message in messages:
+            if message.text and message.text.strip():
+                try:
+                    await update.message.reply_text(
+                        message.text, parse_mode=message.parse_mode, do_quote=False
+                    )
+                except BadRequest:
+                    await update.message.reply_text(message.text, do_quote=False)
+        images = []
+        for path in job.payload.get("images", []):
+            image = validate_image_path(path, self.settings.approved_directory)
+            if image:
+                images.append(image)
+        if images:
+            await self._send_images(update, images)
+
     async def agentic_text(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Direct Claude passthrough. Simple progress. No suggestions."""
+        """Commit long tasks before handing execution to the background queue."""
+        if self.task_queue is None:
+            await self._execute_agentic_text(update, context)
+            return
         user_id = update.effective_user.id
-        message_text = update.message.text
+        rate_limiter = context.bot_data.get("rate_limiter")
+        if rate_limiter:
+            allowed, message = await rate_limiter.check_rate_limit(user_id, 0.001)
+            if not allowed:
+                await update.message.reply_text(f"⏱️ {message}")
+                return
+        user_data = {
+            key: context.user_data[key]
+            for key in (
+                "claude_session_id",
+                "force_new_session",
+                "verbose_level",
+                "_thread_context",
+            )
+            if key in context.user_data
+        }
+        accepted = await self.task_queue.submit(
+            user_id,
+            {
+                "update": update.to_dict(),
+                "directory": str(
+                    context.user_data.get(
+                        "current_directory", self.settings.approved_directory
+                    )
+                ),
+                "user_data": user_data,
+            },
+        )
+        if not accepted:
+            await update.message.reply_text(
+                "A task is already running or waiting for delivery. "
+                "Use its Stop button before starting another task."
+            )
+        else:
+            context.user_data["force_new_session"] = False
+
+    async def _execute_agentic_text(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        job: Any = None,
+        interrupt_event: Optional[asyncio.Event] = None,
+        prompt: Optional[str] = None,
+    ) -> Optional[ClaudeResponse]:
+        """Execute one request; durable jobs leave final delivery to the queue."""
+        user_id = update.effective_user.id
+        message_text = prompt or update.message.text
 
         logger.info(
             "Agentic text message",
@@ -986,7 +1181,7 @@ class MessageOrchestrator:
 
         # Rate limit check
         rate_limiter = context.bot_data.get("rate_limiter")
-        if rate_limiter:
+        if rate_limiter and job is None:
             allowed, limit_message = await rate_limiter.check_rate_limit(user_id, 0.001)
             if not allowed:
                 await update.message.reply_text(f"⏱️ {limit_message}")
@@ -998,7 +1193,7 @@ class MessageOrchestrator:
         verbose_level = self._get_verbose_level(context)
 
         # Create Stop button and interrupt event
-        interrupt_event = asyncio.Event()
+        interrupt_event = interrupt_event or asyncio.Event()
         stop_kb = InlineKeyboardMarkup(
             [[InlineKeyboardButton("Stop", callback_data=f"stop:{user_id}")]]
         )
@@ -1072,6 +1267,17 @@ class MessageOrchestrator:
                 message_thread_id=update.message.message_thread_id,
             )
 
+        execution_options = {}
+        if job is not None:
+
+            async def checkpoint(session_id: str) -> None:
+                await self.task_queue.checkpoint(job.id, session_id)
+
+            execution_options = {
+                "session_checkpoint": checkpoint,
+                "strict_resume": True,
+            }
+
         success = True
         try:
             claude_response = await claude_integration.run_command(
@@ -1083,6 +1289,7 @@ class MessageOrchestrator:
                 force_new=force_new,
                 interrupt_event=interrupt_event,
                 approval_callback=approval_cb,
+                **execution_options,
             )
 
             # New session created successfully — clear the one-shot flag
@@ -1112,6 +1319,13 @@ class MessageOrchestrator:
                 except Exception as e:
                     logger.warning("Failed to log interaction", error=str(e))
 
+            if job is not None:
+                job.payload.setdefault("images", []).extend(
+                    str(image.path) for image in mcp_images
+                )
+                await self.task_queue.save_payload(job)
+                return claude_response
+
             # Format response (no reply_markup — strip keyboards)
             from .utils.formatting import ResponseFormatter, with_stop_reason
 
@@ -1124,6 +1338,8 @@ class MessageOrchestrator:
             )
 
         except Exception as e:
+            if job is not None:
+                raise
             success = False
             logger.error("Claude integration failed", error=str(e), user_id=user_id)
             from .handlers.message import _format_error_message
@@ -1135,6 +1351,11 @@ class MessageOrchestrator:
         finally:
             heartbeat.cancel()
             self._active_requests.pop(user_id, None)
+            if job is not None:
+                try:
+                    await progress_msg.delete()
+                except Exception:
+                    pass
             if draft_streamer:
                 try:
                     await draft_streamer.flush()
@@ -1753,9 +1974,15 @@ class MessageOrchestrator:
             )
             return
 
+        durable_stopped = False
+        if self.task_queue is not None:
+            durable_stopped = await self.task_queue.stop(target_user_id)
         active = self._active_requests.get(target_user_id)
         if not active:
-            await query.answer("Already completed.", show_alert=False)
+            await query.answer(
+                "Stopped." if durable_stopped else "Already completed.",
+                show_alert=False,
+            )
             return
         if active.interrupted:
             await query.answer("Already stopping...", show_alert=False)
